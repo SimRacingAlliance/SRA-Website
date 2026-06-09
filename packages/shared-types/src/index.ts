@@ -14,3 +14,15 @@ export type {
   TeamSeasonResult,
   CountbackEntry,
 } from './points-engine.js';
+  RaceRef,
+  Ruling,
+  PpEvent,
+  RaceWarning,
+  QualWarning,
+  PendingBan,
+  SeasonAdministration,
+  SeasonBanState,
+  DriverLedgerState,
+  RulingEffect,
+  EligibilityStatus,
+} from './penalty-ledger.js';
