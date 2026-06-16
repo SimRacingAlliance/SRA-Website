@@ -7,7 +7,7 @@ import {
   computeActivePp,
   getEligibility,
 } from './penalty-ledger.js';
-import type { PpEvent, RaceRef, Ruling } from '@sra/shared-types';
+import type { DriverLedgerState, PpEvent, RaceRef, Ruling } from '@sra/shared-types';
 
 // ─── test helpers ─────────────────────────────────────────────────────────────
 
@@ -540,5 +540,93 @@ describe('getEligibility', () => {
     ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 1, 1), penaltyPoints: 3 })));
     // at globalSeq=10: diff = 9 > 7 → pp expired → activePp = 0
     expect(getEligibility(state, ref('S1', 10, 10)).activePp).toBe(0);
+  });
+});
+
+// ─── threshold cascade — FIFO queue ───────────────────────────────────────────
+
+describe('threshold cascade — FIFO queue', () => {
+  // Helper: reach 5pp with the qualifying_ban already served.
+  function stateAt5ppQualBanServed(): DriverLedgerState {
+    let state = emptyLedger('d1');
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 1, 1), penaltyPoints: 5 })));
+    state = recordAttendance(state, ref('S1', 2, 2)); // qualifying_ban served
+    return state;
+  }
+
+  // ── cascade ordering ──────────────────────────────────────────────────────
+
+  it('single jump 5pp → 9pp: cascaded bans queued race_ban before pit_lane_start', () => {
+    let state = stateAt5ppQualBanServed();
+    // Single ruling crosses 6pp and 8pp thresholds simultaneously → cascade
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 3, 3), penaltyPoints: 4 })));
+    const unserved = state.pendingBans.filter((b) => !b.served);
+    expect(unserved[0]?.type).toBe('race_ban');
+    expect(unserved[1]?.type).toBe('pit_lane_start');
+  });
+
+  it('single jump 5pp → 9pp: race_ban is served before pit_lane_start', () => {
+    let state = stateAt5ppQualBanServed();
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 3, 3), penaltyPoints: 4 })));
+    state = recordAttendance(state, ref('S1', 4, 4)); // serve front of queue
+    expect(state.pendingBans.find((b) => b.type === 'race_ban')?.served).toBe(true);
+    expect(state.pendingBans.find((b) => b.type === 'pit_lane_start')?.served).toBe(false);
+  });
+
+  // ── miss counter only advances on front-of-queue ──────────────────────────
+  // These two tests fail before the recordAbsence queue fix.
+
+  it('2 misses clears only the front-of-queue ban, not waiting bans', () => {
+    let state = stateAt5ppQualBanServed();
+    // Cascade: queue → [race_ban, pit_lane_start]
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 3, 3), penaltyPoints: 4 })));
+    state = recordAbsence(state, ref('S1', 4, 4));
+    state = recordAbsence(state, ref('S1', 5, 5)); // 2 misses → only front (race_ban) expires
+    expect(state.pendingBans.filter((b) => !b.served && b.type === 'race_ban')).toHaveLength(0);
+    expect(state.pendingBans.filter((b) => !b.served && b.type === 'pit_lane_start')).toHaveLength(1);
+  });
+
+  it('pit_lane_start becomes the active ban after race_ban expires from 2 misses', () => {
+    let state = stateAt5ppQualBanServed();
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 3, 3), penaltyPoints: 4 })));
+    state = recordAbsence(state, ref('S1', 4, 4));
+    state = recordAbsence(state, ref('S1', 5, 5)); // race_ban (front) expires; pit_lane_start now front
+    state = recordAttendance(state, ref('S1', 6, 6)); // serve new front
+    expect(state.pendingBans.find((b) => b.type === 'pit_lane_start')?.served).toBe(true);
+  });
+
+  // ── new ruling while queue is non-empty ───────────────────────────────────
+
+  it('new ban from a subsequent ruling appends to back without preempting', () => {
+    let state = emptyLedger('d1');
+    // 8pp cascade → queue = [race_ban, pit_lane_start, qualifying_ban]
+    ({ state } = applyRuling(state, mkRuling({ raceRef: ref('S1', 1, 1), penaltyPoints: 8 })));
+    const initialLen = state.pendingBans.length;
+    // Qualifying-track ruling adds a second qualifying_ban from the qual track (different path)
+    ({ state } = applyRuling(
+      state,
+      mkRuling({ raceRef: ref('S1', 2, 2), warnings: 1, isQualifyingIncident: true }),
+    ));
+    ({ state } = applyRuling(
+      state,
+      mkRuling({ raceRef: ref('S1', 3, 3), warnings: 1, isQualifyingIncident: true }),
+    ));
+    // New ban appended to back
+    expect(state.pendingBans.length).toBe(initialLen + 1);
+    expect(state.pendingBans[state.pendingBans.length - 1].type).toBe('qualifying_ban');
+    // race_ban still serves first
+    state = recordAttendance(state, ref('S1', 4, 4));
+    expect(state.pendingBans.find((b) => b.type === 'race_ban')?.served).toBe(true);
+  });
+
+  // ── single-threshold crossing: no cascade ─────────────────────────────────
+
+  it('single threshold crossing (4pp): issues exactly one qualifying_ban, no cascade', () => {
+    const { effects } = applyRuling(
+      emptyLedger('d1'),
+      mkRuling({ raceRef: ref('S1', 1, 1), penaltyPoints: 4 }),
+    );
+    expect(effects.bansIssued).toHaveLength(1);
+    expect(effects.bansIssued[0].type).toBe('qualifying_ban');
   });
 });

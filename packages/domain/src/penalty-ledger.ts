@@ -10,6 +10,22 @@ import type {
   SeasonBanState,
 } from '@sra/shared-types';
 
+function bansForSeason(bans: readonly PendingBan[], seasonId: string): PendingBan[] {
+  return bans.filter((b) => b.seasonId === seasonId);
+}
+
+function makeActiveSeasonBan(raceRef: RaceRef): SeasonBanState {
+  return {
+    issuedAtRace: raceRef,
+    bannedInFirstFourRaces: raceRef.raceIndex <= 4,
+    racesAbsent: 0,
+    active: true,
+    onProbation: false,
+    probationRacesAttended: 0,
+    probationPpAccrued: 0,
+  };
+}
+
 export function emptyLedger(driverId: string): DriverLedgerState {
   return {
     driverId,
@@ -28,7 +44,10 @@ export function emptyLedger(driverId: string): DriverLedgerState {
  */
 export function computeActivePp(ppHistory: readonly PpEvent[], asOfRace: RaceRef): number {
   return ppHistory
-    .filter((e) => asOfRace.globalSeq - e.raceRef.globalSeq <= 7)
+    .filter((e) => {
+      const diff = asOfRace.globalSeq - e.raceRef.globalSeq;
+      return diff >= 0 && diff <= 7;
+    })
     .reduce((sum, e) => sum + e.points, 0);
 }
 
@@ -106,10 +125,13 @@ export function applyRuling(
     const newWarning = { raceRef: ruling.raceRef };
     const all = [...raceWarnings, newWarning];
     const sorted = [...all].sort((a, b) => a.raceRef.globalSeq - b.raceRef.globalSeq);
-    const n = sorted.length;
 
-    if (n >= 2 && sorted[n - 1].raceRef.globalSeq - sorted[n - 2].raceRef.globalSeq <= 1) {
-      const consumed = new Set([sorted[n - 1], sorted[n - 2]]);
+    // Find the earliest adjacent pair (FIFO: oldest eligible pair converts first).
+    const pairIdx = sorted.findIndex(
+      (w, i) => i + 1 < sorted.length && sorted[i + 1].raceRef.globalSeq - w.raceRef.globalSeq <= 1,
+    );
+    if (pairIdx !== -1) {
+      const consumed = new Set([sorted[pairIdx], sorted[pairIdx + 1]]);
       raceWarnings = all.filter((w) => !consumed.has(w));
       const ev: PpEvent = { raceRef: ruling.raceRef, points: 1, reason: 'warning-conversion' };
       ppHistory = [...ppHistory, ev];
@@ -137,7 +159,10 @@ export function applyRuling(
     const seq = ruling.raceRef.globalSeq;
     const hasPrior = state.ppHistory
       .filter((e) => e.reason !== 'consecutive-bonus')
-      .some((e) => seq - e.raceRef.globalSeq <= 1);
+      .some((e) => {
+        const diff = seq - e.raceRef.globalSeq;
+        return diff >= 0 && diff <= 1;
+      });
     if (hasPrior) {
       const ev: PpEvent = { raceRef: ruling.raceRef, points: 1, reason: 'consecutive-bonus' };
       ppHistory = [...ppHistory, ev];
@@ -150,19 +175,15 @@ export function applyRuling(
     const addedPp = newPpEvents.reduce((s, e) => s + e.points, 0);
     seasonBan = { ...seasonBan, probationPpAccrued: seasonBan.probationPpAccrued + addedPp };
     if (seasonBan.probationPpAccrued >= 3) {
-      seasonBan = {
-        issuedAtRace: ruling.raceRef,
-        bannedInFirstFourRaces: ruling.raceRef.raceIndex <= 4,
-        racesAbsent: 0,
-        active: true,
-        onProbation: false,
-        probationRacesAttended: 0,
-        probationPpAccrued: 0,
-      };
+      seasonBan = makeActiveSeasonBan(ruling.raceRef);
     }
   }
 
   // ── 8. Threshold checks (once per season) ────────────────────────────────
+  // Bans are appended highest-severity-first (race_ban before pit_lane_start before
+  // qualifying_ban) so that a single ruling crossing multiple thresholds queues them
+  // in FIFO serving order.  A new ruling always appends to the back of the existing
+  // pendingBans array — it never preempts what is already queued.
   const { seasonId } = ruling.raceRef;
   let admin: SeasonAdministration = seasonAdministration.find((a) => a.seasonId === seasonId) ?? {
     seasonId,
@@ -176,15 +197,7 @@ export function applyRuling(
 
   if (activePp >= 10 && !admin.seasonBanAdministered) {
     admin = { ...admin, seasonBanAdministered: true };
-    seasonBan = {
-      issuedAtRace: ruling.raceRef,
-      bannedInFirstFourRaces: ruling.raceRef.raceIndex <= 4,
-      racesAbsent: 0,
-      active: true,
-      onProbation: false,
-      probationRacesAttended: 0,
-      probationPpAccrued: 0,
-    };
+    seasonBan = makeActiveSeasonBan(ruling.raceRef);
   }
   if (activePp >= 8 && !admin.raceBanAdministered) {
     admin = { ...admin, raceBanAdministered: true };
@@ -249,7 +262,7 @@ export function applyRuling(
  */
 export function recordAttendance(state: DriverLedgerState, raceRef: RaceRef): DriverLedgerState {
   // Drop bans from a prior season
-  let pendingBans = state.pendingBans.filter((b) => b.seasonId === raceRef.seasonId);
+  let pendingBans = bansForSeason(state.pendingBans, raceRef.seasonId);
 
   // Serve the first unserved ban
   let servedOne = false;
@@ -293,11 +306,17 @@ export function recordAttendance(state: DriverLedgerState, raceRef: RaceRef): Dr
  */
 export function recordAbsence(state: DriverLedgerState, raceRef: RaceRef): DriverLedgerState {
   // Drop bans from a prior season
-  let pendingBans = state.pendingBans.filter((b) => b.seasonId === raceRef.seasonId);
+  let pendingBans = bansForSeason(state.pendingBans, raceRef.seasonId);
 
-  // Increment miss counter; clear unserved bans at 2 misses
+  // Only the front-of-queue (first unserved) ban counts down its 2-miss timer.
+  // Bans waiting behind it are not yet active, so their timer does not run.
+  let advancedFirst = false;
   pendingBans = pendingBans
-    .map((b) => (b.served ? b : { ...b, racesMissedSinceIssued: b.racesMissedSinceIssued + 1 }))
+    .map((b) => {
+      if (b.served || advancedFirst) return b;
+      advancedFirst = true;
+      return { ...b, racesMissedSinceIssued: b.racesMissedSinceIssued + 1 };
+    })
     .filter((b) => b.served || b.racesMissedSinceIssued < 2);
 
   let seasonBan: SeasonBanState | null = state.seasonBan ? { ...state.seasonBan } : null;
