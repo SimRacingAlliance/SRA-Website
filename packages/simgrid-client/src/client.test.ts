@@ -330,10 +330,10 @@ describe('4xx — non-retryable', () => {
 
   it('401 and 404 carry different status codes so callers can distinguish them', async () => {
     stubFetch({ status: 401 });
-    const authErr = await makeClient().getChampionship(9622).catch((e: unknown) => e as GridOSError);
+    const authErr = (await makeClient().getChampionship(9622).catch((e: unknown) => e)) as GridOSError;
 
     stubFetch({ status: 404 });
-    const notFoundErr = await makeClient().getChampionship(9999).catch((e: unknown) => e as GridOSError);
+    const notFoundErr = (await makeClient().getChampionship(9999).catch((e: unknown) => e)) as GridOSError;
 
     expect(authErr.status).toBe(401);
     expect(notFoundErr.status).toBe(404);
